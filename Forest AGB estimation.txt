@@ -1,0 +1,419 @@
+//Load DEM collection 
+var slope_threshold = 10;
+var slope = ee.Terrain.slope(DEM);                                            
+var HighSlope = slope.gt(slope_threshold);
+var LowSlope = slope.lte(slope_threshold);
+
+var sam_high = sample.filter(ee.Filter.gt('slope', slope_threshold));
+var sam_low = sample.filter(ee.Filter.lte('slope', slope_threshold));
+
+//Load the satellite view in the background
+Map.setOptions('SATELLITE');
+     
+//Centre map view on study area   
+Map.centerObject(StudyArea,5);  
+ 
+// Load in EO Layers
+//-------------------------------------------------------------------------------------------------------              
+//Forest area in 2007
+
+var gfcImage = ee.Image('UMD/hansen/global_forest_change_2021_v1_9');
+var forest = gfcImage.select(['treecover2000']);
+var loss = gfcImage.select(['loss']);
+var lossYear = gfcImage.select(['lossyear']);
+
+// and all other pixels get the value 0
+var lossInFirstEight = lossYear.gte(1).and(lossYear.lte(7));
+
+// Now create an image like the forest image, except with zeros
+// where the lossInFirst image has the value 1.
+var forestAt2007 = forest.where(lossInFirstEight.eq(1), 0).clip(StudyArea).select(['treecover2000'],['treecover2007']);
+var vis = {'min': 0, 'max': 100, 'palette': '000000, 00FF00'};
+
+var forestArea =  forestAt2007.gte(10);
+
+// Load in all Image layers you are using for analysis
+
+//Landsat-5 -----------------------------------------------------------------------------------------------
+var cloudMaskL457 = function(image) {
+  var qa = image.select('pixel_qa');
+  // If the cloud bit (5) is set and the cloud confidence (7) is high
+  // or the cloud shadow bit is set (3), then it's a bad pixel.
+  var cloud = qa.bitwiseAnd(1 << 5)
+                  .and(qa.bitwiseAnd(1 << 7))
+                  .or(qa.bitwiseAnd(1 << 3));
+  // Remove edge pixels that don't occur in all bands
+  var mask2 = image.mask().reduce(ee.Reducer.min());
+  return image.updateMask(cloud.not()).updateMask(mask2);
+};
+
+var Landsat5_SR = ee.ImageCollection('LANDSAT/LT05/C01/T1_SR')
+                  .filterDate('2006-01-01', '2008-12-30')
+                  .filterBounds(StudyArea)
+                  .map(cloudMaskL457);
+// Get L5 projection
+// var l5Projection = Landsat5_SR.min().projection();
+
+//Calculate NDVI and create an image that contains all Landsat 8 bands and NDVI
+var Landsat5_NDVI = Landsat5_SR.map(function(image){
+  var Landsat_NDVI = image.normalizedDifference(['B4', 'B3']).rename('NDVI');
+  return image.addBands(Landsat_NDVI);
+});
+var max_NDVI = Landsat5_NDVI.select(['NDVI'],['max_NDVI']).max().clip(StudyArea);
+var min_NDVI = Landsat5_NDVI.select(['NDVI'],['min_NDVI']).min().clip(StudyArea); 
+var dif_NDVI = max_NDVI.subtract(min_NDVI).rename('dif_NDVI');
+var Landsat5_rename = Landsat5_NDVI.select(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7','NDVI'],
+                         ['LB1', 'LB2', 'LB3', 'LB4', 'LB5', 'LB6', 'LB7','mean_NDVI']).mean();
+
+var composite_Landsat5 = Landsat5_rename.addBands(max_NDVI).addBands(min_NDVI)
+                         .addBands(dif_NDVI).updateMask(forestArea)
+                         ;
+
+//PALSAR---------------------------------------------------------------------------------------------------
+var PALSAR_2007 = ee.Image('JAXA/ALOS/PALSAR/YEARLY/SAR/2007').clip(StudyArea);
+var PALSAR_2007_speckle = PALSAR_2007.focal_mean(150, 'circle', 'meters');
+var PALSAR_2007_rename = PALSAR_2007_speckle.select(['HV','HH'],['PALSAR_HV','PALSAR_HH']);
+var PALSAR_qa = PALSAR_2007.select(['qa'],['PALSAR_qa']);
+var PALSAR_angle = PALSAR_2007.select(['angle'],['PALSAR_angle']);
+
+//Convert the images to dB: sigma= 10log10(DN2)-83
+var ALOS = PALSAR_2007_rename.pow(2).log10().multiply(10).add(-83.0);
+var PALSAR_ratio = ALOS.expression('HV/HH',{'HV': ALOS.select('PALSAR_HV'), 'HH': ALOS.select('PALSAR_HH')})
+                                 .select(['PALSAR_HV'],['L_ratio']);
+var composite_ALOS = ALOS.addBands(PALSAR_qa).addBands(PALSAR_angle).addBands(PALSAR_ratio).updateMask(forestArea);
+
+
+//longitude, latitude
+var longitude_roi = longitude.clip(StudyArea).updateMask(forestArea).select(['b1'],['longitude']);
+var latitude_roi = latitude.clip(StudyArea).updateMask(forestArea).select(['b1'],['latitude']);
+
+//ENVISAT
+var Envisat_mean = envisat.clip(StudyArea).updateMask(forestArea).select(['b1'],['EnvisatMean']);
+//var Envisat_mean_speckle = Envisat_mean.focal_mean(600, 'circle', 'meters');
+
+var Envisat_stddev = envisatstd.clip(StudyArea).updateMask(forestArea).select(['b1'],['EnvisatStd']);
+
+
+// Stack EO predictor variables 
+var stack = composite_ALOS
+          .addBands(DEM)
+          .addBands(slope)
+          .addBands(composite_Landsat5)
+          .addBands(longitude_roi)
+          .addBands(latitude_roi)
+          .addBands(Envisat_mean)
+          .addBands(Envisat_stddev)
+
+var stack = stack.resample('bicubic').reproject({
+  crs: ALOS.projection().crs(),
+  scale: 50
+});         
+//print('EO stack:',stack); 
+ 
+
+// Create Training & Validation Data
+//-------------------------------------------------------------------------------------------------------              
+
+// Attribute column with dependent variable (e.g. AGB)
+var HEIGHT = 'AGB'; 
+ 
+//High slope area ############################################################################### 
+// Add random column to training data (i.e. GEDI data)
+var Seed = 0;
+var GLAS_rand = sample_high.randomColumn('random1', Seed); 
+
+// Split data training & validation
+var SplitValue = 0.6;
+var split_high = SplitValue; // Change this value if you want to use more data for training e.g. 0.6 = 60% used for training
+var trainingSample_high = GLAS_rand.filter(ee.Filter.lt('random1', split_high));
+var validateSample_high = GLAS_rand.filter(ee.Filter.gte('random1', split_high));
+print('trainingSample_high', trainingSample_high);
+print('validateSample_high', validateSample_high);
+
+// Select Bands to use for analysis
+
+var bands_high = ['PALSAR_HV', 'elevation', 'PALSAR_HH',
+             'LB3', 'LB5', 'LB6', 'LB7','max_NDVI','mean_NDVI','min_NDVI','dif_NDVI','longitude', 'latitude',
+             'slope','EnvisatMean','EnvisatStd'];
+//  'PALSAR_qa', 'LB1','LB2','PALSAR_angle','LB4','L_ratio',
+
+// Extract the Spectral Signatures for training the classifier
+//-------------------------------------------------------------------------------------------------------              
+// This finds the mean pixel value for each band in every polygon
+var train_sigs = stack.reduceRegions({
+        collection: trainingSample_high,
+        reducer: ee.Reducer.mean(),
+        scale: 50,
+        tileScale:16             // Default is 1, rang from 1 to 16
+            }).filter(ee.Filter.notNull(bands_high));  
+
+// Create the classifier
+//-------------------------------------------------------------------------------------------------------              
+var rf_trees = 400
+var trees_quantity = rf_trees; 
+var classifier_high = ee.Classifier.smileRandomForest({
+  numberOfTrees: trees_quantity, 
+  variablesPerSplit:null,
+  minLeafPopulation:1,
+  bagFraction: 0.5,
+  maxNodes:null,
+  seed: 0
+  }).setOutputMode('REGRESSION')
+;
+// You will need to test the different parameters of the classifier.
+
+// Train the classifier 
+//-------------------------------------------------------------------------------------------------------              
+var classifier_trained_high = classifier_high.train(train_sigs, HEIGHT, bands_high);
+
+// Classify the imagery
+//-------------------------------------------------------------------------------------------------------              
+// Apply the trainined classifier to the image layers
+var classified_image_high_all = stack.classify(classifier_trained_high);
+print('classified_image_high_all',classified_image_high_all);
+
+var classified_high = classified_image_high_all.updateMask(HighSlope)
+
+//LowSlope areas ########################################################################################
+var Seed_low = 0;
+var GLAS_rand_low = sample_low.randomColumn('random2', Seed_low);
+
+// Split data training & validation
+var split_low = SplitValue; 
+var trainingSample_low = GLAS_rand_low.filter(ee.Filter.lt('random2', split_low));
+var validateSample_low = GLAS_rand_low.filter(ee.Filter.gte('random2', split_low));
+print('trainingSample_low', trainingSample_low);
+print('validateSample_low', validateSample_low);
+// Select Bands to use for analysis
+//-------------------------------------------------------------------------------------------------------              
+var bands_low = ['PALSAR_HV', 'elevation',   'LB2','PALSAR_angle','L_ratio','LB4','longitude', 'latitude',
+              'LB5', 'LB6', 'LB7','max_NDVI','dif_NDVI',
+            'slope','EnvisatMean','EnvisatStd'];
+//'PALSAR_qa',LB1','PALSAR_HH','mean_NDVI','min_NDVI','LB3', 
+//-------------------------------------------------------------------------------------------------------              
+var train_sigs_low = stack.reduceRegions({
+        collection: trainingSample_low,
+        reducer: ee.Reducer.mean(),
+        scale: 50,
+        tileScale:16             // Default is 1, rang from 1 to 16
+            }).filter(ee.Filter.notNull(bands_low));  
+// Create the classifier
+//-------------------------------------------------------------------------------------------------------              
+var trees_quantity_low = rf_trees; //40 gets a better r2
+var classifier_low = ee.Classifier.smileRandomForest({
+  numberOfTrees: trees_quantity_low, 
+  variablesPerSplit:null,
+  minLeafPopulation:1,
+  bagFraction: 0.5,
+  maxNodes:null,
+  seed: 0
+  }).setOutputMode('REGRESSION')
+;
+// Train the classifier 
+//-------------------------------------------------------------------------------------------------------              
+var classifier_trained_low = classifier_low.train(train_sigs_low, HEIGHT, bands_low);
+
+// Classify the imagery
+//-------------------------------------------------------------------------------------------------------              
+// Apply the trainined classifier to the image layers
+var classified_image_low_all = stack.classify(classifier_trained_low);
+print('classified_image_low_all',classified_image_low_all);
+
+var classified_low = classified_image_low_all.updateMask(LowSlope);
+
+//Without EnviSAT areas --------------------------------------------------------------------------------
+// Add random column to training data (i.e. GEDI data)
+var Seed_noE = 0;
+var GLAS_rand_noE = sample_low.randomColumn('random3', Seed_noE);
+
+// Split data  for training & validation
+var split_noE = SplitValue; // Change this value if you want to use more data for training e.g. 0.7 = 70% used for training
+
+var trainingSample_noE = GLAS_rand.filter(ee.Filter.lt('random', split_noE));
+var validateSample_noE = GLAS_rand.filter(ee.Filter.gte('random', split_noE));
+print('trainingSample_noE', trainingSample_noE);
+print('validateSample_noE', validateSample_noE);
+
+// Select Bands to use for analysis
+//-------------------------------------------------------------------------------------------------------              
+//Select the bands you want to use to train the classifier (You may not want to use all image bands).
+
+var bands_noE = ['PALSAR_HV', 'elevation',   'LB2','PALSAR_angle','L_ratio','LB4','longitude', 'latitude',
+              'LB5', 'LB6', 'LB7','max_NDVI','dif_NDVI',
+            'slope'];
+//-------------------------------------------------------------------------------------------------------              
+// This finds the mean pixel value for each band in every polygon (GEDI footprint)
+var train_sigs_noE = stack.reduceRegions({
+        collection: trainingSample_noE,
+        reducer: ee.Reducer.mean(),
+        scale: 50,
+        tileScale:16             // Default is 1, rang from 1 to 16
+            }).filter(ee.Filter.notNull(bands_low));  
+// Create the classifier
+//-------------------------------------------------------------------------------------------------------              
+var trees_quantity_noE = rf_trees; //40 gets a better r2
+var classifier_noE = ee.Classifier.smileRandomForest({
+  numberOfTrees: trees_quantity_noE, 
+  variablesPerSplit:null,
+  minLeafPopulation:1,
+  bagFraction: 0.5,
+  maxNodes:null,
+  seed: 0
+  }).setOutputMode('REGRESSION')
+;
+// Train the classifier 
+//-------------------------------------------------------------------------------------------------------              
+var classifier_trained_noE = classifier_noE.train(train_sigs_noE, HEIGHT, bands_noE);
+
+// Classify the imagery
+//-------------------------------------------------------------------------------------------------------              
+// Apply the trainined classifier to the image layers
+var classified_image_noE_all = stack.classify(classifier_trained_noE)//.select(['classification'],['classification2']);
+//print('classified_image_noE_all',classified_image_noE_all);
+
+
+//variable importance############################################################################
+var dict_low = classifier_trained_low.explain();
+var dict_high = classifier_trained_high.explain(); 
+var dict_noE = classifier_trained_noE.explain();
+
+var variable_importance_low = ee.Feature(null, ee.Dictionary(dict_low).get('importance'));
+var variable_importance_high = ee.Feature(null, ee.Dictionary(dict_high).get('importance'));
+var variable_importance_noE = ee.Feature(null, ee.Dictionary(dict_noE).get('importance'));
+
+var chart_low =
+  ui.Chart.feature.byProperty(variable_importance_low)
+    .setChartType('ColumnChart')
+    .setOptions({
+      title: 'Random Forest Variable Importance (Flat area)',
+      legend: {position: 'none'},
+      hAxis: {title: 'Bands'},
+      vAxis: {title: 'Importance'}
+    });
+print(chart_low); 
+
+var chart_high =
+  ui.Chart.feature.byProperty(variable_importance_high)
+    .setChartType('ColumnChart')
+    .setOptions({
+      title: 'Random Forest Variable Importance (steep slope)',
+      legend: {position: 'none'},
+      hAxis: {title: 'Bands'},
+      vAxis: {title: 'Importance'}
+    });
+print(chart_high); 
+
+var chart_noE =
+  ui.Chart.feature.byProperty(variable_importance_noE)
+    .setChartType('ColumnChart')
+    .setOptions({
+      title: 'Random Forest Variable Importance (withour Envisat)',
+      legend: {position: 'none'},
+      hAxis: {title: 'Bands'},
+      vAxis: {title: 'Importance'}
+    });
+print(chart_noE); 
+
+
+//Merge the clssified images #################################################
+var classified_image = ee.ImageCollection([classified_high, classified_low]).mosaic();
+print('classified_image',classified_image);
+var classified_image_china = ee.ImageCollection([classified_image_noE_all, classified_image]).mosaic();
+print('classified_image_china',classified_image_china);
+
+
+// // Validation##############################################################################################
+// // High----------------------------------------------------------------------------------------------------              
+
+// Extract the Spectral Signatures for validation data
+var val_sigs_high = classified_image_china.reduceRegions({
+        collection: validateSample_high,
+        reducer: ee.Reducer.mean(),
+        scale: 50,
+        tileScale:16            
+            });  
+
+// Train the validation data
+var Validation_trained_high = classifier_high.train(val_sigs_high, HEIGHT, bands_high);
+
+// Classify the validation data 
+var validated_high = val_sigs_high.classify(Validation_trained_high);
+
+var chart1 = ui.Chart.feature.byFeature(val_sigs_high,HEIGHT, 'mean')
+            .setChartType('ScatterChart')
+            .setOptions({
+              title:'High slope Predicted Vs Observed',
+              pointSize:2,
+              hAxis:{title:'Observed', minValue:0,maxValue:30},
+              vAxis:{title:'Predicted', minValue:0,maxValue:30},
+              trendlines:{
+                0:{
+                  type:'linear',
+                  showR2:true,
+                  visibleInLegend:true,
+              }
+            }
+          });
+print(chart1);
+
+//Low--------------------------------------------------------------------------------------------------------
+var val_sigs_low = classified_image_china.reduceRegions({
+        collection: validateSample_low,
+        reducer: ee.Reducer.mean(),
+        scale: 50,
+        tileScale:16            
+            });  
+
+// Train the validation data
+var Validation_trained_low = classifier_low.train(val_sigs_low, HEIGHT, bands_low);
+
+
+// Classify the validation data 
+var validated = val_sigs_low.classify(Validation_trained_low);
+// print('validated',validated.first());
+
+var chart2 = ui.Chart.feature.byFeature(val_sigs_low,HEIGHT, 'mean')
+            .setChartType('ScatterChart')
+            .setOptions({
+              title:'Low slope Predicted Vs Observed',
+              pointSize:2,
+              hAxis:{title:'Observed', minValue:0,maxValue:30},
+              vAxis:{title:'Predicted', minValue:0,maxValue:30},
+              trendlines:{
+                0:{
+                  type:'linear',
+                  showR2:true,
+                  visibleInLegend:true,
+              }
+            }
+          });
+print(chart2);
+
+// Display###################################################################################################
+//-------------------------------------------------------------------------------------------------------              
+
+Map.addLayer(classified_image_china, {min: 0, max: 200, palette: ['1667fa', 'c9270d', 'cf7b68', 'ee9a1c', '146d0e', '04bd23',
+'37fe05']},'classified_image_china');
+
+var addProp_high = function (feat)
+{
+  var reduce2007 = classified_image_china.reduceRegion(ee.Reducer.mean(),feat.geometry(),50);
+  return feat.set({'predict2007high':reduce2007.get('classification')});
+};
+var addProp_low = function (feat)
+{
+  var reduce2007 = classified_image_china.reduceRegion(ee.Reducer.mean(),feat.geometry(),50);
+  return feat.set({'predict2007low':reduce2007.get('classification')});
+};
+var newft_high = validateSample_high.map(addProp_high);
+var newft_low = validateSample_low.map(addProp_low);
+
+//Export results-----------------------------------------------------------------------------
+Export.image.toDrive({
+  image: classified_image_china,
+  description: 'AGB',
+  scale: 50, 
+  region: StudyArea,
+  maxPixels: 1e13
+ });
+ 

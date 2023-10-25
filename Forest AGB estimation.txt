@@ -103,13 +103,7 @@ var stack = composite_ALOS
           .addBands(latitude_roi)
           .addBands(Envisat_mean)
           .addBands(Envisat_stddev)
-
-var stack = stack.resample('bicubic').reproject({
-  crs: ALOS.projection().crs(),
-  scale: 50
-});         
-//print('EO stack:',stack); 
- 
+          .reproject({crs: ALOS.projection(), scale: 50});  
 
 // Create Training & Validation Data
 //-------------------------------------------------------------------------------------------------------              
